@@ -1,0 +1,83 @@
+name: infra
+
+on:
+  pull_request:
+    paths: ["modules/**", "environments/**", ".github/workflows/infra.yml"]
+  push:
+    branches: [main]
+    paths: ["modules/**", "environments/**"]
+
+permissions:
+  id-token: write # OIDC to AWS
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.10.x
+      - run: tofu fmt -check -recursive
+      - run: make validate TF=tofu
+      - uses: terraform-linters/setup-tflint@v4
+      - run: tflint --init && tflint --recursive
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { env: dev,     role: TF_ROLE_ARN_DEV }
+          - { env: staging, role: TF_ROLE_ARN_STAGING }
+          - { env: prod,    role: TF_ROLE_ARN_PROD }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.10.x
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[matrix.role] }}
+          aws-region: ap-southeast-1
+      - run: tofu -chdir=environments/${{ matrix.env }} init -backend-config=backend.hcl -input=false
+      - run: tofu -chdir=environments/${{ matrix.env }} plan -input=false -lock-timeout=5m
+
+  # dev -> staging -> prod, one at a time. Add required reviewers to the
+  # "prod" GitHub Environment to get a manual approval gate before prod.
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        include:
+          - { env: dev,     role: TF_ROLE_ARN_DEV }
+          - { env: staging, role: TF_ROLE_ARN_STAGING }
+          - { env: prod,    role: TF_ROLE_ARN_PROD }
+    environment: ${{ matrix.env }}
+    concurrency: tf-${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.10.x
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[matrix.role] }}
+          aws-region: ap-southeast-1
+      - run: tofu -chdir=environments/${{ matrix.env }} init -backend-config=backend.hcl -input=false
+      - run: tofu -chdir=environments/${{ matrix.env }} apply -input=false -auto-approve -lock-timeout=5m
